@@ -582,6 +582,10 @@ class BrokerTransaction:
         list a row for every holding, and each line spent on one row is a
         line the next one is pushed down by.
         """
+        return f"{self._headline()}\n  {self._read_from_line()}"
+
+    def _headline(self) -> str:
+        """Build the first line: what the row did, then its figures."""
         what = [self.date.isoformat(), str(self.action)]
         if self.quantity is not None:
             what.append(display_str(self.quantity))
@@ -590,6 +594,14 @@ class BrokerTransaction:
         if self.symbol is not None:
             what.append(self.symbol)
 
+        headline = " ".join(what)
+        money = self._money_parts()
+        if money:
+            headline += ", " + ", ".join(money)
+        return headline
+
+    def _money_parts(self) -> list[str]:
+        """List the row's figures, each labelled and carrying its currency."""
         # The price is labelled and grouped with the other figures rather
         # than trailing the symbol: an option's symbol already ends in "at a
         # strike of N", and "at a strike of 50 at 1 USD" reads as one clause.
@@ -608,11 +620,10 @@ class BrokerTransaction:
             f"fees {display_str(fee)} {code}"
             for code, fee in sorted(self.foreign_fees.items())
         ]
+        return money
 
-        headline = " ".join(what)
-        if money:
-            headline += ", " + ", ".join(money)
-
+    def _read_from_line(self) -> str:
+        """Build the second line: what the row is, and where it was read from."""
         # Never the source's `account`: it is a calculation-local token for
         # the boundary the user declared, and reads as an account number it
         # is not.
@@ -634,7 +645,7 @@ class BrokerTransaction:
             place = f"row {self.source.row} of " if self.source.row is not None else ""
             where.append(f"read from {place}{self.source.file}")
 
-        return f"{headline}\n  {', '.join(where)}"
+        return ", ".join(where)
 
 
 class RuleType(Enum):

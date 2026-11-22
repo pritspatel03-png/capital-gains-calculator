@@ -69,20 +69,149 @@ FIRST_DOWNLOADED_RATES_MONTH: Final = dt.date(2015, 2, 1)
 type _StartingRates = dict[dt.date, Decimal]
 
 
-def _why_the_request_failed(err: Exception) -> str:
-    """Say in words why a request failed; --verbose shows the error itself."""
-    # A proxy or certificate failure is also a `ConnectionError`, so it goes first.
-    match err:
-        case requests_exceptions.ProxyError():
-            return "could not connect through the proxy"
-        case requests_exceptions.SSLError():
-            return "the secure connection to the server failed"
-        case requests_exceptions.ConnectionError():
-            return "no connection to the server"
-        case requests_exceptions.RetryError():
-            # HTTP 502, 503 or 504 to every one of the session's retries.
-            return "the server kept answering with an error"
-    return f"the request failed ({type(err).__name__})"
+class HmrcRateDownloader:
+    """Fetch a month of HMRC exchange rates over HTTP.
+
+    Kept apart from `CurrencyConverter`: talking to the HMRC endpoints, with
+    their retries and their failures, is one concern; holding the rate history
+    and converting amounts with it is another. The converter owns one of these
+    and reaches the network only through it.
+    """
+
+    def __init__(self) -> None:
+        """Build a rate-limited session that retries transient server errors."""
+        # Limit borrowed from the Companies House API guidance:
+        # https://developer-specs.company-information.service.gov.uk/guides/rateLimiting
+        # Without schedule_leak=False the limiter starts a thread that holds an
+        # event loop and its descriptors open for as long as the limiter
+        # exists. The bucket counts only the requests inside the window, so the
+        # limit holds without it.
+        limiter = Limiter(
+            SingleBucketFactory(
+                InMemoryBucket([Rate(600, Duration.MINUTE * 5)]), schedule_leak=False
+            )
+        )
+        self.session = RateLimitedRequestsSession(limiter)
+        retries = Retry(total=5, backoff_factor=1, status_forcelist=[502, 503, 504])
+        self.session.mount("https://", HTTPAdapter(max_retries=retries))
+
+    @staticmethod
+    def _why_the_request_failed(err: Exception) -> str:
+        """Say in words why a request failed; --verbose shows the error itself."""
+        # A proxy or certificate failure is also a `ConnectionError`, so it goes first.
+        match err:
+            case requests_exceptions.ProxyError():
+                return "could not connect through the proxy"
+            case requests_exceptions.SSLError():
+                return "the secure connection to the server failed"
+            case requests_exceptions.ConnectionError():
+                return "no connection to the server"
+            case requests_exceptions.RetryError():
+                # HTTP 502, 503 or 504 to every one of the session's retries.
+                return "the server kept answering with an error"
+        return f"the request failed ({type(err).__name__})"
+
+    def download_month(
+        self,
+        date: dt.date,
+        currency: CurrencyCode,
+        exchange_rates_file: Path | None,
+    ) -> dict[CurrencyCode, Decimal]:
+        """Download the month's rates for `date`; `currency` is the one wanted.
+
+        ``exchange_rates_file`` is named in the advice a failure gives, as the
+        place a rate can be added by hand instead.
+        """
+        month = f"{date:%Y-%m}"
+        LOGGER.info("Fetching HMRC exchange rates for %s...", month)
+        # Pre 2021 we need to use the old HMRC endpoint
+        if date.year < NEW_ENDPOINT_FROM_YEAR:
+            url = (
+                "https://www.hmrc.gov.uk/softwaredevelopers/rates/"
+                f"exrates-monthly-{date:%m%y}.xml"
+            )
+        else:
+            url = (
+                "https://www.trade-tariff.service.gov.uk/uk/api/"
+                f"exchange_rates/files/monthly_xml_{month}.xml"
+            )
+        advice = "Try again later, or add the rate to " + rates_file_row(
+            currency, date, exchange_rates_file
+        )
+
+        def failed(problem: str) -> ExternalApiError:
+            """Say what went wrong, then what to do, the same way for every failure."""
+            return ExternalApiError(url, problem, advice)
+
+        try:
+            response = self.session.get(url, timeout=10)
+        except Exception as err:
+            raise failed(
+                f"Could not download HMRC exchange rates for {month}: "
+                f"{self._why_the_request_failed(err)}."
+            ) from err
+
+        def reply_start() -> str:
+            """Give the start of what the service sent, to follow a line about it."""
+            # On one line, however many the reply has: a page of markup would
+            # otherwise push the address and the advice out of sight.
+            body = " ".join(response.text.split())
+            if not body:
+                return ""
+            limit = 200
+            return f" Response body: {body[:limit]}{'...' if len(body) > limit else ''}"
+
+        if not response.ok:
+            raise failed(
+                f"HMRC API returned HTTP {response.status_code} for {month}."
+                f"{reply_start()}"
+            )
+
+        try:
+            tree = ET.fromstring(response.text)
+        except (ET.ParseError, DefusedXmlException) as err:
+            # A maintenance or sign-in page sent with status 200, for example, or
+            # XML that declares an entity, which defusedxml refuses to read.
+            raise failed(
+                f"HMRC API response for {month} cannot be read as XML.{reply_start()}"
+            ) from err
+        rates: dict[CurrencyCode, Decimal] = {}
+        for row in tree:
+            # Decompose the "every expected field is present" check into the two
+            # texts it is really about, so the guard reads as what it protects
+            # and each text is known to be a string once past it.
+            currency_code_elem = row.find("currencyCode")
+            rate_new_elem = row.find("rateNew")
+            code_text = (
+                currency_code_elem.text if currency_code_elem is not None else None
+            )
+            rate_text = rate_new_elem.text if rate_new_elem is not None else None
+            if code_text is None or rate_text is None:
+                raise failed(
+                    f"HMRC API response for {month} is missing expected currency data."
+                )
+            listed = CurrencyCode.parse(code_text)
+            if listed is None:
+                raise failed(
+                    f"HMRC API response for {month} contains invalid currency code: "
+                    f"{code_text!r}."
+                )
+            try:
+                rate = Decimal(rate_text)
+            except (InvalidOperation, ValueError) as err:
+                raise failed(
+                    f"HMRC API response for {month} contains invalid rate: {rate_text}."
+                ) from err
+            rate_is_usable = rate.is_finite() and rate > 0
+            if not rate_is_usable:
+                raise failed(
+                    f"HMRC API response for {month} contains a non-positive "
+                    f"or non-finite rate: {rate_text}."
+                )
+            rates[listed] = rate
+        if not rates:
+            raise failed(f"HMRC API response for {month} has no rates.")
+        return rates
 
 
 class CurrencyConverter:
@@ -103,21 +232,8 @@ class CurrencyConverter:
         self._reported: set[tuple[dt.date, CurrencyCode]] = set()
         # The rates of each month downloaded in this run, by its first day.
         self._downloaded: dict[dt.date, dict[CurrencyCode, Decimal]] = {}
-
-        # Limit borrowed from the Companies House API guidance:
-        # https://developer-specs.company-information.service.gov.uk/guides/rateLimiting
-        # Without schedule_leak=False the limiter starts a thread that holds an
-        # event loop and its descriptors open for as long as the limiter
-        # exists. The bucket counts only the requests inside the window, so the
-        # limit holds without it.
-        limiter = Limiter(
-            SingleBucketFactory(
-                InMemoryBucket([Rate(600, Duration.MINUTE * 5)]), schedule_leak=False
-            )
-        )
-        self.session = RateLimitedRequestsSession(limiter)
-        retries = Retry(total=5, backoff_factor=1, status_forcelist=[502, 503, 504])
-        self.session.mount("https://", HTTPAdapter(max_retries=retries))
+        # HTTP access to the HMRC endpoints is kept in its own object.
+        self.downloader = HmrcRateDownloader()
 
     @staticmethod
     def create(exchange_rates_file: Path | None = None) -> CurrencyConverter:
@@ -324,103 +440,12 @@ class CurrencyConverter:
         """
         first = date.replace(day=1)
         if first not in self._downloaded:
-            self._downloaded[first] = self._download_month(date, currency)
+            self._downloaded[first] = self.downloader.download_month(
+                date, currency, self.exchange_rates_file
+            )
         # Rows already held for the date stay in use: one may have been typed in.
         self.cache[date] = {**self._downloaded[first], **self.cache.get(date, {})}
         self._write_exchange_rates_file(self.exchange_rates_file, self.cache)
-
-    def _download_month(
-        self, date: dt.date, currency: CurrencyCode
-    ) -> dict[CurrencyCode, Decimal]:
-        """Download the month's rates for `date`; `currency` is the one wanted."""
-        month = f"{date:%Y-%m}"
-        LOGGER.info("Fetching HMRC exchange rates for %s...", month)
-        # Pre 2021 we need to use the old HMRC endpoint
-        if date.year < NEW_ENDPOINT_FROM_YEAR:
-            url = (
-                "https://www.hmrc.gov.uk/softwaredevelopers/rates/"
-                f"exrates-monthly-{date:%m%y}.xml"
-            )
-        else:
-            url = (
-                "https://www.trade-tariff.service.gov.uk/uk/api/"
-                f"exchange_rates/files/monthly_xml_{month}.xml"
-            )
-        advice = "Try again later, or add the rate to " + rates_file_row(
-            currency, date, self.exchange_rates_file
-        )
-
-        def failed(problem: str) -> ExternalApiError:
-            """Say what went wrong, then what to do, the same way for every failure."""
-            return ExternalApiError(url, problem, advice)
-
-        try:
-            response = self.session.get(url, timeout=10)
-        except Exception as err:
-            raise failed(
-                f"Could not download HMRC exchange rates for {month}: "
-                f"{_why_the_request_failed(err)}."
-            ) from err
-
-        def reply_start() -> str:
-            """Give the start of what the service sent, to follow a line about it."""
-            # On one line, however many the reply has: a page of markup would
-            # otherwise push the address and the advice out of sight.
-            body = " ".join(response.text.split())
-            if not body:
-                return ""
-            limit = 200
-            return f" Response body: {body[:limit]}{'...' if len(body) > limit else ''}"
-
-        if not response.ok:
-            raise failed(
-                f"HMRC API returned HTTP {response.status_code} for {month}."
-                f"{reply_start()}"
-            )
-
-        try:
-            tree = ET.fromstring(response.text)
-        except (ET.ParseError, DefusedXmlException) as err:
-            # A maintenance or sign-in page sent with status 200, for example, or
-            # XML that declares an entity, which defusedxml refuses to read.
-            raise failed(
-                f"HMRC API response for {month} cannot be read as XML.{reply_start()}"
-            ) from err
-        rates: dict[CurrencyCode, Decimal] = {}
-        for row in tree:
-            currency_code_elem = row.find("currencyCode")
-            rate_new_elem = row.find("rateNew")
-            if (
-                currency_code_elem is None
-                or currency_code_elem.text is None
-                or rate_new_elem is None
-                or rate_new_elem.text is None
-            ):
-                raise failed(
-                    f"HMRC API response for {month} is missing expected currency data."
-                )
-            listed = CurrencyCode.parse(currency_code_elem.text)
-            if listed is None:
-                raise failed(
-                    f"HMRC API response for {month} contains invalid currency code: "
-                    f"{currency_code_elem.text!r}."
-                )
-            try:
-                rate = Decimal(rate_new_elem.text)
-            except (InvalidOperation, ValueError) as err:
-                raise failed(
-                    f"HMRC API response for {month} contains invalid rate: "
-                    f"{rate_new_elem.text}."
-                ) from err
-            if not rate.is_finite() or rate <= 0:
-                raise failed(
-                    f"HMRC API response for {month} contains a non-positive "
-                    f"or non-finite rate: {rate_new_elem.text}."
-                )
-            rates[listed] = rate
-        if not rates:
-            raise failed(f"HMRC API response for {month} has no rates.")
-        return rates
 
     def currency_to_gbp_rate(self, currency: CurrencyCode, date: dt.date) -> Decimal:
         """Get the number of currency units per GBP at the given date."""

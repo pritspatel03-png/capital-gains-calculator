@@ -247,7 +247,7 @@ def test_hmrc_fetch_announces_itself(
 ) -> None:
     """Fetching rates from HMRC logs a progress line before the request."""
     converter = CurrencyConverter()
-    monkeypatch.setattr(converter, "session", OfflineSession())
+    monkeypatch.setattr(converter.downloader, "session", OfflineSession())
 
     with caplog.at_level(logging.INFO), pytest.raises(ExternalApiError):
         converter.currency_to_gbp_rate(CurrencyCode("USD"), dt.date(2021, 5, 10))
@@ -351,7 +351,7 @@ def test_query_hmrc_api_http_error_includes_snippet() -> None:
     """Include a truncated response body in HTTP errors."""
     converter = CurrencyConverter()
     response = FakeResponse(ok=False, status_code=500, text="x" * 300)
-    converter.session = FakeSession(response)  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = FakeSession(response)  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     with pytest.raises(ExternalApiError, match="HTTP 500") as excinfo:
         converter.currency_to_gbp_rate(CurrencyCode("USD"), DATE)
@@ -530,7 +530,7 @@ def test_a_failed_download_says_what_went_wrong_and_what_to_do(
     """
     rates_file = tmp_path / "rates.csv"
     converter = CurrencyConverter(exchange_rates_file=rates_file)
-    converter.session = session  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = session  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     with pytest.raises(ExternalApiError) as excinfo:
         converter.currency_to_gbp_rate(CurrencyCode("EUR"), date)
@@ -573,7 +573,7 @@ def test_a_month_is_downloaded_once_however_many_of_its_dates_need_it(
     rates_file = tmp_path / "rates.csv"
     converter = CurrencyConverter(exchange_rates_file=rates_file)
     session = MonthlyFiles({"0619": "1.2611", "0719": "1.2532", "0620": "1.2331"})
-    converter.session = session  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = session  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     with caplog.at_level(logging.INFO):
         for date, rate in (
@@ -633,7 +633,7 @@ def test_a_row_typed_for_one_currency_leaves_the_others_to_be_downloaded(
         "</exchangeRateMonthList>"
     )
     session = FakeSession(FakeResponse(ok=True, text=xml))
-    converter.session = session  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = session  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     assert converter.currency_to_gbp_rate(CurrencyCode("EUR"), date) == Decimal(
         "1.1307"
@@ -656,7 +656,7 @@ def test_a_first_save_makes_the_folder_for_the_rates_file(tmp_path: Path) -> Non
     """On a first run the folder the rates file goes in may not be there yet."""
     rates_file = tmp_path / "out" / "rates.csv"
     converter = CurrencyConverter(exchange_rates_file=rates_file)
-    converter.session = _monthly_usd("1.2532")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = _monthly_usd("1.2532")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     converter.currency_to_gbp_rate(USD, dt.date(2019, 7, 1))
 
@@ -714,7 +714,7 @@ def test_a_run_stopped_as_it_saves_leaves_the_rates_file_as_it_was(
         exchange_rates_file=rates_file,
         initial_data={dt.date(2020, 6, 1): {USD: rate}},
     )
-    converter.session = _monthly_usd("1.2532")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = _monthly_usd("1.2532")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     with pytest.raises(KeyboardInterrupt):
         converter.currency_to_gbp_rate(USD, dt.date(2019, 7, 1))
@@ -733,7 +733,7 @@ def test_two_runs_that_save_at_once_both_finish(tmp_path: Path) -> None:
     rates_file = tmp_path / "rates.csv"
     rates_file.write_bytes(TYPED_ROW)
     second = CurrencyConverter(exchange_rates_file=rates_file)
-    second.session = _monthly_usd("1.2331")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    second.downloader.session = _monthly_usd("1.2331")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
     files_when_the_second_saved: list[int] = []
 
     def second_run_saves() -> None:
@@ -746,7 +746,7 @@ def test_two_runs_that_save_at_once_both_finish(tmp_path: Path) -> None:
         exchange_rates_file=rates_file,
         initial_data={dt.date(2021, 6, 1): {USD: rate}},
     )
-    first.session = _monthly_usd("1.2532")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    first.downloader.session = _monthly_usd("1.2532")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     first.currency_to_gbp_rate(USD, dt.date(2019, 7, 1))
 
@@ -772,7 +772,7 @@ def test_a_rates_file_that_cannot_be_written_is_reported_and_left_alone(
     if os.access(rates_file, os.W_OK):
         pytest.skip("this user may write to a read-only file")
     converter = CurrencyConverter(exchange_rates_file=rates_file)
-    converter.session = _monthly_usd("1.2532")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = _monthly_usd("1.2532")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     with pytest.raises(CgtError) as raised:
         converter.currency_to_gbp_rate(USD, dt.date(2019, 7, 1))
@@ -800,7 +800,7 @@ def test_a_save_keeps_a_linked_rates_file_and_its_permissions(tmp_path: Path) ->
     rates_file = tmp_path / "rates.csv"
     rates_file.symlink_to(kept)
     converter = CurrencyConverter(exchange_rates_file=rates_file)
-    converter.session = _monthly_usd("1.2532")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = _monthly_usd("1.2532")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     assert converter.currency_to_gbp_rate(USD, dt.date(2019, 7, 1)) == Decimal("1.2532")
 
@@ -902,7 +902,7 @@ def test_a_date_before_february_2015_that_does_not_ship_is_not_asked_of_hmrc(
     March 2002 is before the first month that ships.
     """
     converter = CurrencyConverter(exchange_rates_file=tmp_path / "rates.csv")
-    converter.session = OfflineSession()  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = OfflineSession()  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     with pytest.raises(HmrcRateMissingError, match=r"a row '2002-03-28,USD,<rate>'"):
         converter.currency_to_gbp_rate(USD, dt.date(2002, 3, 28))
@@ -930,7 +930,7 @@ def test_a_rate_hmrc_changed_during_the_month_applies_from_its_date(
     is not asked: it would also leave that rate on file.
     """
     converter = CurrencyConverter()
-    converter.session = _monthly_usd("1.5003")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = _monthly_usd("1.5003")  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     assert converter.currency_to_gbp_rate(currency, date) == rate
     assert converter.cache == {}
@@ -963,7 +963,7 @@ def test_rates_from_april_2002_come_with_cgt_calc(
 ) -> None:
     """HMRC's download has no file for these months, so they are not asked for."""
     converter = CurrencyConverter()
-    converter.session = OfflineSession()  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = OfflineSession()  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     assert converter.currency_to_gbp_rate(currency, date) == rate
 
@@ -976,7 +976,7 @@ def test_every_year_of_shipped_rates_loads(year: int) -> None:
     row would otherwise reach a user before any test opened that year.
     """
     converter = CurrencyConverter()
-    converter.session = OfflineSession()  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = OfflineSession()  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     assert converter.currency_to_gbp_rate(USD, dt.date(year, 4, 15))
 
@@ -997,7 +997,7 @@ def test_a_month_that_ships_is_never_downloaded() -> None:
     next run would overrule the rows this one wrote.
     """
     converter = CurrencyConverter()
-    converter.session = OfflineSession()  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    converter.downloader.session = OfflineSession()  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
     with pytest.raises(HmrcRateMissingError):
         converter.currency_to_gbp_rate(CurrencyCode("XAU"), dt.date(2016, 1, 27))

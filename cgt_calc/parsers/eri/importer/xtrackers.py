@@ -8,7 +8,6 @@ import logging
 import re
 from typing import TYPE_CHECKING, override
 
-import dateutil.parser as date_parser
 import pdfplumber
 
 from cgt_calc.exceptions import ParsingError
@@ -123,22 +122,6 @@ class XtrackersImporter(ERIImporter):
                 return None
         LOGGER.info("Done parsing Xtrackers file")
         return result
-
-    @staticmethod
-    def _extract_report_end_date(page: Page, prefix: str) -> dt.date | None:
-        matches = [
-            line["text"]
-            for line in page.extract_text_lines()
-            if prefix.lower() in line["text"].lower()
-        ]
-        if not matches:
-            return None
-        date_str = matches[0][len(prefix) :].strip()
-        try:
-            date = date_parser.parse(date_str, fuzzy=True, dayfirst=True)
-        except date_parser.ParserError:
-            return None
-        return date.date()
 
     @staticmethod
     def _extract_table(
